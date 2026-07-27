@@ -151,47 +151,20 @@ class CampostApiController extends Controller
                 ], 404);
             }
 
-            // Détermination dynamique du statut de paiement des frais
-            $statut = strtoupper($data['statut'] ?? $data['status'] ?? '');
-            $aDejaPaye = in_array($statut, ['PAYE', 'PAID', 'VALIDE', 'SOLDE']) 
-                         || (isset($data['solde']) && (int)$data['solde'] === 0)
-                         || (isset($data['montant_restant']) && (int)$data['montant_restant'] === 0);
+            // ---------------------------------------------------------
+            // DEMANDE DU CLIENT : AUCUNE DONNÉE EN DUR.
+            // On renvoie EXATEMENT ce que l'API SYGEAP a fourni.
+            // (La réponse SYGEAP contient déjà ministere, parcours, etablissement, typeServices)
+            // ---------------------------------------------------------
+            
+            // On s'assure d'avoir 'success' => true
+            if (is_array($data)) {
+                $data['success'] = true;
+            } else {
+                $data = ['success' => true, 'data' => $data];
+            }
 
-            $montantFrais = (int) ($data['montant_frais'] ?? $data['montant'] ?? $data['solde'] ?? 25000);
-
-            $typeServices = $aDejaPaye ? [] : [
-                [
-                    'libelle' => $data['libelle_frais'] ?? $data['service'] ?? 'Frais de Concours / Scolarité',
-                    'montant' => $montantFrais
-                ]
-            ];
-
-            return response()->json([
-                'success' => true,
-                'ministere' => [
-                    'code' => 'MINEPIA',
-                    'libelle' => "Ministère de l'Élevage, des Pêches et des Industries Animales"
-                ],
-                'matricule' => $data['matricule'] ?? $matricule,
-                'nom' => $data['nom'] ?? $data['lastname'] ?? '',
-                'prenom' => $data['prenom'] ?? $data['firstname'] ?? '',
-                'email' => $data['email'] ?? '',
-                'dateNaissance' => $data['dateNaissance'] ?? $data['date_naissance'] ?? $data['birthdate'] ?? '',
-                'parcours' => [
-                    'code' => $data['parcours']['code'] ?? $data['parcours_code'] ?? 'TSA',
-                    'libelle' => $data['parcours']['libelle'] ?? $data['parcours_libelle'] ?? "Technicien Supérieur d'Agriculture",
-                    'option' => [
-                        'code' => $data['parcours']['option']['code'] ?? $data['option_code'] ?? 'EAP',
-                        'libelle' => $data['parcours']['option']['libelle'] ?? $data['option_libelle'] ?? "Entrepreneuriat Agro-Pastoral"
-                    ]
-                ],
-                'etablissement' => [
-                    'code' => $data['etablissement']['code'] ?? $data['etablissement_code'] ?? 'ETA-001',
-                    'libelle' => $data['etablissement']['libelle'] ?? $data['etablissement_libelle'] ?? "École Pratique d'Agriculture",
-                    'region' => $data['etablissement']['region'] ?? $data['region'] ?? 'Centre'
-                ],
-                'typeServices' => $typeServices
-            ], 200);
+            return response()->json($data, 200);
 
         } catch (\Exception $e) {
             Log::error("SYGEAP Exception pour matricule {$matricule} : " . $e->getMessage());

@@ -56,6 +56,10 @@ class ApprenantController extends Controller
             // On sauvegarde le matricule en session pour l'étape du paiement
             Session::put('matricule', $matricule);
 
+            // On sauvegarde aussi les services à payer pour construire les options de tranches dynamiquement
+            $typeServices = $donnees['typeServices'] ?? $donnees['data']['typeServices'] ?? [];
+            Session::put('typeServices', $typeServices);
+
             // On envoie les VRAIES données à la vue fiche.blade.php
             return view('fiche', ['donnees' => $donnees]);
         }
@@ -72,13 +76,52 @@ class ApprenantController extends Controller
 
         $matricule = session('matricule');
 
-        // Ici, on pourrait plus tard filtrer selon ce qui a déjà été payé
-        $options = [
-            ['id' => 'inscription', 'label' => 'Frais d\'Inscription', 'montant' => 10000],
-            ['id' => 'tranche1', 'label' => 'Tranche 1', 'montant' => 25000],
-            ['id' => 'tranche2', 'label' => 'Tranche 2', 'montant' => 15000],
-            ['id' => 'complet', 'label' => 'Scolarité Complète', 'montant' => 50000],
-        ];
+        // Utilisation des VRAIES données de l'API (enregistrées en session lors de la recherche)
+        $typeServices = session('typeServices', []);
+        $options = [];
+
+        // Parsing dynamique des tranches depuis SYGEAP
+        foreach ($typeServices as $ts) {
+            $tsLibelle = $ts['libelle'] ?? 'Frais';
+            if (!empty($ts['services'])) {
+                foreach ($ts['services'] as $service) {
+                    if (empty($service['tranches'])) {
+                        // Pas de tranches = paiement total direct
+                        $options[] = [
+                            'id' => 'service_' . $service['id'],
+                            'label' => $tsLibelle,
+                            'montant' => $service['montant']
+                        ];
+                    } else {
+                        // S'il y a des tranches, on les liste (triées par ordre)
+                        $tranches = $service['tranches'];
+                        usort($tranches, function ($a, $b) {
+                            return ($a['ordre'] ?? 0) <=> ($b['ordre'] ?? 0);
+                        });
+
+                        foreach ($tranches as $tranche) {
+                            $options[] = [
+                                'id' => 'tranche_' . $tranche['id'],
+                                'label' => $tsLibelle . ' - ' . ($tranche['libelle'] ?? 'Tranche ' . ($tranche['ordre'] ?? '')),
+                                'montant' => $tranche['montant']
+                            ];
+                        }
+                        
+                        // Option de paiement complet
+                        $options[] = [
+                            'id' => 'service_complet_' . $service['id'],
+                            'label' => $tsLibelle . ' (Paiement complet)',
+                            'montant' => $service['montant']
+                        ];
+                    }
+                }
+            }
+        }
+
+        // Sécurité : si aucun frais n'est à payer
+        if (empty($options)) {
+            return redirect('/')->with('success', 'Cet apprenant a déjà réglé la totalité de ses frais. Aucun paiement requis.');
+        }
 
         return view('choix_tranche', compact('options', 'matricule'));
     }
@@ -93,19 +136,43 @@ class ApprenantController extends Controller
 public function telechargerBordereau($matricule, $trancheId)
 {
     // Sécurité : On vérifie si les informations sont cohérentes
-    if (session('matricule') !== $matricule) {
+    if (session('matricule') !== $matricule || !Session::has('typeServices')) {
         return redirect('/')->withErrors(['erreur' => 'Session expirée ou invalide.']);
     }
 
-    // Dictionnaire des montants
-    $lesTranches = [
-        'inscription' => ['label' => 'Frais d\'Inscription', 'montant' => 10000],
-        'tranche1'    => ['label' => 'Tranche 1 de Scolarité', 'montant' => 25000],
-        'tranche2'    => ['label' => 'Tranche 2 de Scolarité', 'montant' => 15000],
-        'complet'     => ['label' => 'Scolarité Complète', 'montant' => 50000],
-    ];
+    $typeServices = session('typeServices', []);
+    $choix = null;
 
-    $choix = $lesTranches[$trancheId] ?? ['label' => 'Frais Divers', 'montant' => 0];
+    // Recherche de l'option correspondante
+    foreach ($typeServices as $ts) {
+        $tsLibelle = $ts['libelle'] ?? 'Frais';
+        if (!empty($ts['services'])) {
+            foreach ($ts['services'] as $service) {
+                if (empty($service['tranches']) && 'service_' . $service['id'] === $trancheId) {
+                    $choix = ['label' => $tsLibelle, 'montant' => $service['montant']];
+                                        break 2;
+                } elseif (!empty($service['tranches'])) {
+                    if ('service_complet_' . $service['id'] === $trancheId) {
+                        $choix = ['label' => $tsLibelle . ' (Paiement complet)', 'montant' => $service['montant']];
+                        break 2;
+                    }
+                    foreach ($service['tranches'] as $tranche) {
+                        if ('tranche_' . $tranche['id'] === $trancheId) {
+                            $choix = [
+                                'label' => $tsLibelle . ' - ' . ($tranche['libelle'] ?? 'Tranche ' . ($tranche['ordre'] ?? '')),
+                                'montant' => $tranche['montant']
+                            ];
+                            break 3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!$choix) {
+        return redirect('/')->withErrors(['erreur' => 'Option de paiement introuvable ou invalide.']);
+    }
 
     $data = [
         'matricule'   => $matricule,
