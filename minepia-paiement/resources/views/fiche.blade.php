@@ -140,6 +140,33 @@
             </a>
         </div>
 
+        {{-- Messages Flash --}}
+        @if(session('success'))
+            <div class="alert alert-success alert-dismissible fade show rounded-4 shadow-sm border-0 d-flex align-items-center mb-4" role="alert" style="background-color: #d1fae5; color: #065f46;">
+                <i class="fas fa-check-circle fa-2x me-3 text-success"></i>
+                <div>
+                    <h6 class="alert-heading mb-1 fw-bold">Paiement Validé !</h6>
+                    <p class="mb-0">{{ session('success') }}</p>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        @endif
+
+        @if($errors->any())
+            <div class="alert alert-danger alert-dismissible fade show rounded-4 shadow-sm border-0 d-flex align-items-center mb-4" role="alert">
+                <i class="fas fa-exclamation-triangle fa-2x me-3 text-danger"></i>
+                <div>
+                    <h6 class="alert-heading mb-1 fw-bold">Attention</h6>
+                    <ul class="mb-0 ps-3">
+                        @foreach($errors->all() as $error)
+                            <li>{{ $error }}</li>
+                        @endforeach
+                    </ul>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        @endif
+
         {{-- Carte Informations apprenant --}}
         <div class="card info-card mb-4">
             <div class="card-body">

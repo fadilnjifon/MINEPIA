@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 use App\Models\User;
+use App\Models\PaiementRecu;
 
 class CampostApiController extends Controller
 {
@@ -46,45 +47,60 @@ class CampostApiController extends Controller
     }
 
     /**
-     * 1. Authentification Machine CamPost
+     * 1. Authentification Machine — SYGEAP / Systèmes Tiers
      * POST /api/account/auth
+     *
+     * Permet au système externe SYGEAP de s'authentifier et de récupérer un Bearer Token Sanctum.
+     * Accepte : username (nom d'utilisateur ou email) + password.
+     * Retourne : { success, accessToken, dateExpiration }
      */
     public function auth(Request $request)
     {
         $validator = Validator::make($request->all(), [
             'username' => 'required|string',
             'password' => 'required|string',
+        ], [
+            'username.required' => 'Le champ username est obligatoire.',
+            'password.required' => 'Le champ password est obligatoire.',
         ]);
 
         if ($validator->fails()) {
             return response()->json([
                 'success' => false,
                 'message' => 'Paramètres invalides',
-                'errors' => $validator->errors()
+                'errors'  => $validator->errors(),
             ], 400);
         }
 
+        // Recherche de l'utilisateur par username OU email, avec le flag is_campost = true
         $user = User::where(function ($query) use ($request) {
-                    $query->where('username', $request->username)
-                          ->orWhere('email', $request->username);
-                })
-                ->where('is_campost', true)
-                ->first();
+                        $query->where('name', $request->username)
+                              ->orWhere('email', $request->username);
+                    })
+                    ->where('is_campost', true)
+                    ->first();
 
         if (!$user || !Hash::check($request->password, $user->password)) {
+            Log::warning('Tentative d\'authentification API échouée pour : ' . $request->username);
             return response()->json([
                 'success' => false,
-                'message' => 'Identifiants incorrects ou accès non autorisé'
+                'message' => 'Identifiants incorrects ou accès non autorisé.',
             ], 401);
         }
 
-        $tokenResult = $user->createToken('campost_api_token');
+        // Révocation des anciens tokens pour éviter la prolifération
+        $user->tokens()->where('name', 'sygeap_api_token')->delete();
+
+        $tokenExpiration = now()->addYear();
+        $tokenResult = $user->createToken('sygeap_api_token', ['*'], $tokenExpiration);
         $token = $tokenResult->plainTextToken;
 
+        Log::info('Authentification API réussie pour : ' . $user->name . ' (email: ' . $user->email . ')');
+
         return response()->json([
-            'success' => true,
-            'accessToken' => $token,
-            'dateExpiration Refresh Token' => now()->addYear()->toIso8601String(),
+            'success'        => true,
+            'accessToken'    => $token,
+            'dateExpiration' => $tokenExpiration->toIso8601String(),
         ], 200);
     }
 
@@ -260,6 +276,139 @@ class CampostApiController extends Controller
         } catch (\Exception $e) {
             Log::error('CAMPOST Webhook Exception: ' . $e->getMessage());
             return response()->json(false, 500);
+        }
+    }
+
+    /**
+     * 5. Enregistrement d'un Paiement effectué au Guichet par un Agent CamPost
+     * POST /api/campost/paiement
+     *
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function enregistrerPaiementGuichet(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'matricule'        => 'required|string',
+            'tranche_id'       => 'required|string',
+            'montant'          => 'required|numeric|min:100',
+            'reference_agent'  => 'nullable|string',
+        ], [
+            'matricule.required'  => 'Le matricule du candidat/apprenant est obligatoire.',
+            'tranche_id.required' => 'L\'identifiant de la tranche de paiement est obligatoire.',
+            'montant.required'    => 'Le montant du paiement est obligatoire.',
+            'montant.numeric'     => 'Le montant doit être un nombre valide.',
+            'montant.min'         => 'Le montant minimum est de 100 FCFA.',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur de validation des données fournies.',
+                'errors'  => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $matricule = trim($request->input('matricule'));
+            $trancheId = trim((string) $request->input('tranche_id'));
+            $montant = (float) $request->input('montant');
+            $referenceAgent = $request->input('reference_agent');
+            $datePaiement = now();
+            $annee = $datePaiement->format('Y');
+
+            // Génération Sécurisée et Imprévisible du Numéro de Reçu avec vérification d'unicité
+            $maxAttempts = 10;
+            $attempts = 0;
+            $numeroRecu = null;
+
+            do {
+                $attempts++;
+                $randomBytes = bin2hex(random_bytes(8));
+                $secretKey = config('app.key') ?: env('APP_KEY', 'base64:minepia-campost-secret');
+                $hash = strtoupper(substr(hash('sha256', $matricule . microtime(true) . $randomBytes . $secretKey), 0, 12));
+                $candidateRecu = "REC-{$annee}-{$hash}";
+
+                if (!PaiementRecu::where('numero_recu', $candidateRecu)->exists()) {
+                    $numeroRecu = $candidateRecu;
+                    break;
+                }
+            } while ($attempts < $maxAttempts);
+
+            if (!$numeroRecu) {
+                Log::error("Échec de génération d'un numéro de reçu unique après {$maxAttempts} tentatives.");
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Erreur lors de la génération du numéro de reçu sécurisé. Veuillez réessayer.',
+                ], 500);
+            }
+
+            // Enregistrement en base de données dans la table paiements_recus
+            $user = $request->user();
+            $paiement = PaiementRecu::create([
+                'numero_recu'       => $numeroRecu,
+                'matricule'         => $matricule,
+                'tranche_id'        => $trancheId,
+                'montant'           => $montant,
+                'statut'            => 'PAID',
+                'date_paiement'     => $datePaiement,
+                'reference_campost' => $referenceAgent,
+                'operateur'         => 'CAMPOST',
+                'metadata'          => [
+                    'agent_id'        => $user?->id,
+                    'agent_name'      => $user?->name,
+                    'agent_email'     => $user?->email,
+                    'reference_agent' => $referenceAgent,
+                    'ip'              => $request->ip(),
+                    'user_agent'      => $request->userAgent(),
+                ],
+            ]);
+
+            Log::info("Paiement Guichet CamPost enregistré: Reçu [{$numeroRecu}], Matricule [{$matricule}], Tranche [{$trancheId}], Montant [{$montant}], Agent [{$user?->email}]");
+
+            // Notification / Synchronisation vers SYGEAP si possible (en tâche de fond / sans bloquer la réponse)
+            try {
+                $token = $this->getSygeapToken();
+                if ($token) {
+                    $baseUrl = rtrim(config('services.sygeap.url') ?: (env('SYGEAP_BASE_URL') ?: env('SYGEAP_API_URL')), '/');
+                    Http::withoutVerifying()
+                        ->timeout(10)
+                        ->withToken($token)
+                        ->post("{$baseUrl}/api/campost/notify-payment", [
+                            'reference'     => $numeroRecu,
+                            'matricule'     => $matricule,
+                            'tranche_id'    => $trancheId,
+                            'transactionId' => $referenceAgent ?: $numeroRecu,
+                            'status'        => 'PAID',
+                            'montant'       => $montant,
+                            'date_paiement' => $datePaiement->toIso8601String(),
+                        ]);
+                }
+            } catch (\Exception $syncEx) {
+                Log::warning("Notification SYGEAP post-paiement guichet ignorée ou échouée: " . $syncEx->getMessage());
+            }
+
+            return response()->json([
+                'success'      => true,
+                'message'      => 'Paiement enregistré avec succès',
+                'numeroRecu'   => $numeroRecu,
+                'matricule'    => $matricule,
+                'trancheId'    => $trancheId,
+                'montant'      => $montant,
+                'statut'       => 'PAID',
+                'datePaiement' => $datePaiement->format('Y-m-d H:i:s'),
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error("Erreur enregistrement paiement guichet CamPost: " . $e->getMessage(), [
+                'exception' => $e,
+                'request'   => $request->except(['password']),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Une erreur interne est survenue lors de l\'enregistrement du paiement.',
+            ], 500);
         }
     }
 }
